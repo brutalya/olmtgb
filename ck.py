@@ -1,101 +1,174 @@
+import http.client
+import json
+import hashlib
+import ssl
 import os
-import requests
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Загрузить переменные из .env
+# Загрузить переменные окружения из .env файла
 load_dotenv()
 
-# Переменные для основного сервера
-API_URL = os.getenv("API_URL")
-CERT_SHA256 = os.getenv("CERT_SHA256")
+# Получаем значения из .env
+api_url = os.getenv("API_URL")
+cert_sha256 = os.getenv("CERT_SHA256")
+api_url_ru = os.getenv("API_URL_RU")
+cert_sha256_ru = os.getenv("CERT_SHA256_RU")
+telegram_token = os.getenv("TELEGRAM_TOKEN")
+authorized_username = os.getenv("AUTHORIZED_USERNAME")
 
-# Переменные для второго сервера
-API_URL_RU = os.getenv("API_URL_RU")
-CERT_SHA256_RU = os.getenv("CERT_SHA256_RU")
+# Проверка сертификата с использованием cert_sha256
+def verify_cert_sha256(cert_der, cert_sha256):
+    sha256_fingerprint = hashlib.sha256(cert_der).hexdigest().upper()
+    return sha256_fingerprint == cert_sha256
 
-# Токен Telegram-бота
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Функция для выполнения запросов к серверу Outline
+def outline_request(api_url, cert_sha256, method, endpoint, json_data=None):
+    url_parts = api_url.split("://")[1].split("/")
+    host = url_parts[0]
+    path = "/" + "/".join(url_parts[1:] + [endpoint])
 
+    context = ssl._create_unverified_context()
+    conn = http.client.HTTPSConnection(host, context=context)
 
+    try:
+        conn.connect()
+        der_cert = conn.sock.getpeercert(binary_form=True)
+        if not verify_cert_sha256(der_cert, cert_sha256):
+            conn.close()
+            return None
+
+        headers = {"Content-Type": "application/json"}
+        body = json.dumps(json_data) if json_data else None
+        conn.request(method, path, body, headers)
+
+        response = conn.getresponse()
+        data = response.read().decode()
+        if response.status not in (200, 201):
+            return None
+
+        return json.loads(data) if data else None
+    except Exception as e:
+        print(f"Error sending request: {e}")
+        return None
+    finally:
+        conn.close()
+
+# Проверка доступа по username
+def is_authorized(update: Update) -> bool:
+    return update.message.from_user.username == authorized_username
+
+# Функция для получения всех ключей с использованием нужных API URL и сертификата
 def get_keys(api_url, cert_sha256):
-    """Получить список ключей доступа с сервера Outline."""
-    url = f"{api_url}/access-keys"
-    headers = {"X-Outline-Api-Key": cert_sha256}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json().get("accessKeys", [])
+    keys = outline_request(api_url, cert_sha256, "GET", "access-keys")
+    usage_data = outline_request(api_url, cert_sha256, "GET", "metrics/transfer")
+    result = []
+    
+    if keys and usage_data:
+        usage_dict = usage_data.get("bytesTransferredByUserId", {})
 
+        for i, key in enumerate(keys.get("accessKeys", []), start=1):
+            name = key.get("name", "No name")
+            key_id = key["id"]
+            
+            # Лимит данных (если установлен)
+            data_limit_bytes = key.get("dataLimit", {}).get("bytes")
+            data_limit = f"{data_limit_bytes / (1024 * 1024):.2f} MB" if data_limit_bytes else "No limit"
+            
+            # Использование данных
+            data_usage_bytes = usage_dict.get(key_id, 0)
+            data_usage = f"{data_usage_bytes / (1024 * 1024):.2f} MB"
 
-def create_key(api_url, cert_sha256, name):
-    """Создать новый ключ доступа на сервере Outline."""
-    url = f"{api_url}/access-keys"
-    headers = {"X-Outline-Api-Key": cert_sha256}
-    data = {"name": name}
-    response = requests.post(url, json=data, headers=headers)
-    response.raise_for_status()
-    return response.json()
+            # Форматируем вывод для каждого ключа с выравниванием по колонкам
+            if data_limit_bytes:
+                result.append(f"{i:<2}. Name: {name:<15} Data: {data_usage:<10} / {data_limit}")
+            else:
+                result.append(f"{i:<2}. Name: {name:<15} Data: {data_usage}")
 
+    return result
 
-def list_keys(update: Update, context: CallbackContext, api_url, cert_sha256):
-    """Отправить список ключей в Telegram."""
-    try:
-        keys = get_keys(api_url, cert_sha256)
-        if keys:
-            response_text = "\n".join(
-                [f"ID: {key['id']}, Name: {key['name']}, Data Limit: {key.get('dataLimit', 'No limit')}" for key in keys]
-            )
+# Функции для обработки команд /keys и /keysru
+async def keys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await update.message.reply_text("You have no access to this bot.")
+        return
+
+    keys_list = get_keys(api_url, cert_sha256)
+    if keys_list:
+        formatted_keys = "\n".join(keys_list)
+        await update.message.reply_text(f"<pre>{formatted_keys}</pre>", parse_mode="HTML")
+    else:
+        await update.message.reply_text("Keys are not found.")
+
+async def keys_ru(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await update.message.reply_text("You have no access to this bot.")
+        return
+
+    keys_list = get_keys(api_url_ru, cert_sha256_ru)
+    if keys_list:
+        formatted_keys = "\n".join(keys_list)
+        await update.message.reply_text(f"<pre>{formatted_keys}</pre>", parse_mode="HTML")
+    else:
+        await update.message.reply_text("Keys are not found.")
+
+# Функция для создания или получения ключа с использованием нужных API URL и сертификата
+def get_or_create_key(api_url, cert_sha256, name):
+    keys = outline_request(api_url, cert_sha256, "GET", "access-keys")
+    for key in keys.get("accessKeys", []):
+        if key.get("name") == name:
+            return key["accessUrl"]
+
+    new_key = outline_request(api_url, cert_sha256, "POST", "access-keys")
+    if new_key:
+        outline_request(api_url, cert_sha256, "PUT", f"access-keys/{new_key['id']}/name", {"name": name})
+        return new_key["accessUrl"]
+    return None
+
+# Функции для обработки команд /key и /keyru
+async def key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await update.message.reply_text("You have no access to this bot.")
+        return
+
+    if context.args:
+        name = " ".join(context.args)
+        access_url = get_or_create_key(api_url, cert_sha256, name)
+        if access_url:
+            await update.message.reply_text(f"Key '{name}' is available at this address:\n<pre>{access_url}</pre>", parse_mode="HTML")
         else:
-            response_text = "Нет доступных ключей на этом сервере."
-        update.message.reply_text(response_text)
-    except requests.RequestException as e:
-        update.message.reply_text(f"Ошибка при получении ключей: {e}")
+            await update.message.reply_text("Error getting a key.")
+    else:
+        await update.message.reply_text("Please specify a key name after the /key command to create a new key or retrieve an existing one.")
 
+async def key_ru(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await update.message.reply_text("You have no access to this bot.")
+        return
 
-def list_keys_main(update: Update, context: CallbackContext):
-    list_keys(update, context, API_URL, CERT_SHA256)
-
-
-def list_keys_ru(update: Update, context: CallbackContext):
-    list_keys(update, context, API_URL_RU, CERT_SHA256_RU)
-
-
-def add_key(update: Update, context: CallbackContext, api_url, cert_sha256, name):
-    """Добавить ключ на сервер Outline."""
-    try:
-        new_key = create_key(api_url, cert_sha256, name)
-        response_text = f"Создан новый ключ: ID: {new_key['id']}, Name: {new_key['name']}"
-        update.message.reply_text(response_text)
-    except requests.RequestException as e:
-        update.message.reply_text(f"Ошибка при создании ключа: {e}")
-
-
-def add_key_main(update: Update, context: CallbackContext):
-    name = " ".join(context.args) if context.args else "default"
-    add_key(update, context, API_URL, CERT_SHA256, name)
-
-
-def add_key_ru(update: Update, context: CallbackContext):
-    name = " ".join(context.args) if context.args else "default"
-    add_key(update, context, API_URL_RU, CERT_SHA256_RU, name)
-
+    if context.args:
+        name = " ".join(context.args)
+        access_url = get_or_create_key(api_url_ru, cert_sha256_ru, name)
+        if access_url:
+            await update.message.reply_text(f"Key '{name}' is available at this address:\n<pre>{access_url}</pre>", parse_mode="HTML")
+        else:
+            await update.message.reply_text("Error getting a key.")
+    else:
+        await update.message.reply_text("Please specify a key name after the /keyru command to create a new key or retrieve an existing one.")
 
 def main():
-    updater = Updater(TELEGRAM_BOT_TOKEN)
-    dispatcher = updater.dispatcher
+    # Настройка бота
+    application = Application.builder().token(telegram_token).build()
 
-    # Команды для основного сервера
-    dispatcher.add_handler(CommandHandler("keys", list_keys_main))
-    dispatcher.add_handler(CommandHandler("key", add_key_main))
+    # Команды бота
+    application.add_handler(CommandHandler("keys", keys))
+    application.add_handler(CommandHandler("keysru", keys_ru))
+    application.add_handler(CommandHandler("key", key))
+    application.add_handler(CommandHandler("keyru", key_ru))
 
-    # Команды для второго сервера
-    dispatcher.add_handler(CommandHandler("keysru", list_keys_ru))
-    dispatcher.add_handler(CommandHandler("keyru", add_key_ru))
-
-    updater.start_polling()
-    updater.idle()
-
+    # Запуск бота
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
